@@ -1,12 +1,13 @@
 # J_PyDB
 
-A tiny, file-system-backed JSON-like DB for simple projects — each **database** is a folder, each **table** is a subfolder, and each value is a `.txt` file. Supports optional encryption via `cryptography.fernet` and binary file storage. Simple, safe, and great for prototypes, tooling, or tiny apps. ⚡️✨
+A tiny, file-system-backed JSON-like DB for simple projects — each **database** is a folder, each **table** is a subfolder, and each value is a `.txt` file. Supports optional encryption via `cryptography.fernet`, secure hashing (PBKDF2-SHA256) for non-reversible values like passwords, and binary file storage. Simple, safe, and great for prototypes, tooling, or tiny apps. ⚡️✨
 
 ---
 
 ## Features
 - Filesystem-first: no external DB required.
 - Optional encryption using a passphrase (Fernet / AES-GCM under the hood).
+- Optional non-reversible hashing (PBKDF2-HMAC-SHA256) for values such as passwords.
 - Binary file storage (`write_file` / `read_file`).
 - Table / DB create, drop, list.
 - Read / write / delete values.
@@ -18,10 +19,11 @@ A tiny, file-system-backed JSON-like DB for simple projects — each **database*
 
 ## Requirements
 - Python 3.8+ (recommended)
-- `cryptography` package
+- `cryptography` package (only required if you plan to use `encrypt=True`)
 
 Install required package:
-~~~bash
+
+~~~
 pip install cryptography
 ~~~
 
@@ -29,12 +31,16 @@ pip install cryptography
 
 ## Quickstart
 
-1. Set a master key (required) — this derives a Fernet key from your passphrase:
-~~~python
+> Note: The constructor **no longer requires** a master key. You only need to call `J_PyDB.setMasterKey(...)` if you want to use encryption (`encrypt=True`). Hashing uses Python stdlib and does not require `cryptography`.
+
+~~~
 from J_PyDB import J_PyDB, J_PyDBError
 
-# MUST call before creating any J_PyDB instance
+# OPTIONAL: set a master key if you want encrypt/decrypt support
 J_PyDB.setMasterKey("super-secret-passphrase")
+# You can remove the master key later with:
+# J_PyDB.unsetMasterKey()
+
 db = J_PyDB(base_path="data_folder")
 
 # create DB + table
@@ -45,17 +51,48 @@ db.create_table("Website", "Users")
 db.write_value("Website", "Users", "alice", value="hello world")
 print(db.read_value("Website", "Users", "alice"))  # "hello world"
 
-# write & read an encrypted value
+# write & read an encrypted value (requires setMasterKey)
 db.write_value("Website", "Users", "secret_user", value="Pa$$w0rd!", encrypt=True)
 print(db.read_value("Website", "Users", "secret_user", decrypt=True))  # "Pa$$w0rd!"
+
+# store a hashed value (non-reversible) - great for passwords
+db.write_value("Website", "Users", "alice_pw", value="Pa$$w0rd!", hash=True)
+
+# verify a hashed value (returns True/False)
+is_ok = db.verify_value("Website", "Users", "alice_pw", "Pa$$w0rd!")
+print("Password ok?", is_ok)
 ~~~
+
+---
+
+## Value storage formats & compatibility 🔐
+
+- **Hashed values** are stored as:
+
+~~~
+HASH$pbkdf2_sha256$<iterations>$<salt_b64>$<hash_b64>
+~~~
+
+These are **non-reversible** — use `verify_value(...)` to compare plaintext against the stored hash.
+
+- **Encrypted values** are stored as:
+
+~~~
+FERNET$<fernet_token>
+~~~
+
+For backwards compatibility, raw Fernet tokens (legacy strings beginning `gAAAA`) are also accepted.
+
+- **Plain text** is stored as-is (a simple string in the `*.txt` file).
+
+**Important:** `write_value(..., encrypt=True, hash=True)` is invalid — pick one (encrypt _or_ hash).
 
 ---
 
 ## Examples
 
 ### Binary files
-~~~python
+~~~
 # store a binary file (keeps the original filename)
 db.write_file("Website", "Users", "alice_pic", file_path="path/to/image.png")
 
@@ -66,7 +103,7 @@ with open("out.png", "wb") as f:
 ~~~
 
 ### Export / Import table
-~~~python
+~~~
 # export a table into a nested dict (text values as str, binary as bytes)
 table_data = db.export_table("Website", "Users")
 
@@ -74,21 +111,28 @@ table_data = db.export_table("Website", "Users")
 db.import_table("Website", "ImportedUsers", table_data)
 ~~~
 
-### Transactions
-~~~python
-try:
-    db.begin("Website")
-    # operations during transaction are staged in-memory (writes/deletes recorded)
-    # (Note: the commit applies them via the public write_value/delete_value methods)
-    db._transactions["Website"]["writes"].append(("Users", ("temp",), "tempval"))
-    # ... more staging ...
-    db.commit("Website")
-except Exception as e:
-    db.rollback("Website")
-    raise
+### Hashing & verification
+~~~
+# store hashed password (PBKDF2-HMAC-SHA256)
+db.write_value("App", "Users", "bob_pw", value="hunter2", hash=True)
+
+# verify it later
+ok = db.verify_value("App", "Users", "bob_pw", "hunter2")  # True
+bad = db.verify_value("App", "Users", "bob_pw", "wrong")   # False
 ~~~
 
-> ⚠️ Transaction model: transactions are in-memory records in `self._transactions`. On `commit` the staged writes are executed through `write_value` and deletes through `delete_value`. The transaction system is intentionally simple — it's primarily intended to provide grouped operations rather than full ACID semantics.
+### Transactions
+~~~
+try:
+    db.begin("Website")
+    # stage ops manually (internal structure used by this tiny tx model)
+    db._transactions["Website"]["writes"].append(("Users", ("temp",), "tempval"))
+    db.commit("Website")
+except Exception:
+    db.rollback("Website")
+~~~
+
+> ⚠️ Transaction model: transactions are in-memory records in `self._transactions`. On `commit` the staged writes are executed through `write_value` and deletes through `delete_value`. This is intentionally simple — it's for grouped operations, not full ACID semantics.
 
 ---
 
@@ -99,10 +143,12 @@ except Exception as e:
 - `TransactionError` — transaction-specific error
 
 **Class methods**
-- `J_PyDB.setMasterKey(passphrase: str)` — derive and set the class-wide Fernet key. **Must** be called before creating a `J_PyDB` instance that uses encryption.
+- `J_PyDB.setMasterKey(passphrase: str)` — derive and set the class-wide Fernet key for encryption.
+- `J_PyDB.unsetMasterKey()` — remove the class-wide Fernet key (disable encrypt/decrypt capability).
+- `J_PyDB.set_default_hash_iterations(iters: int)` — adjust PBKDF2 iteration count (default is 100_000).
 
 **Constructor**
-- `J_PyDB(base_path=".")` — create instance rooted at `base_path`. Raises `J_PyDBError` if master key not set.
+- `J_PyDB(base_path=".")` — create instance rooted at `base_path`. **Master key is optional**; only required when you call `write_value(..., encrypt=True)` or `read_value(..., decrypt=True)`.
 
 **DB / Table management**
 - `create_db(db)` — create database folder
@@ -113,11 +159,15 @@ except Exception as e:
 - `list_tables(db)` -> list of tables in DB
 
 **Value operations**
-- `write_value(db, tbl, *keys, value=None, encrypt=False)` — store text value under nested keys (final key becomes `*.txt`). If `encrypt=True`, value is encrypted with Fernet.
-- `read_value(db, tbl, *keys, decrypt=False)` -> str — read value; use `decrypt=True` to decrypt.
+- `write_value(db, tbl, *keys, value=None, encrypt=False, hash=False, hash_iterations=None, overwrite=True)`  
+  Store text under nested keys (final key becomes `*.txt`). Use `encrypt=True` to encrypt with the master Fernet key; use `hash=True` to store a PBKDF2 hash (non-reversible). If both flags are True, an error is raised.
+- `read_value(db, tbl, *keys, decrypt=False)` -> str  
+  Read value. If the stored value was encrypted, pass `decrypt=True` to get plaintext. You **cannot** decrypt hashed values.
+- `verify_value(db, tbl, *keys, plaintext: str)` -> bool  
+  Verify a plaintext against the stored value: works with hashed, encrypted, and plaintext storage.
 - `delete_value(db, tbl, *keys)` -> bool — delete value file (and remove empty directories up to table root).
 - `exists(db, tbl, *keys)` -> bool — checks if value exists (or directory exists for nested keys).
-- `list_keys(db, tbl, *prefix_keys)` -> list of entries (files and subdirs)
+- `list_keys(db, tbl, *prefix_keys)` -> list of entries (files and subdirs).
 
 **File (binary) operations**
 - `write_file(db, tbl, *keys, file_path)` — stores binary file keeping original filename.
@@ -136,45 +186,57 @@ except Exception as e:
 
 ## Behavioural notes & gotchas
 
-- **Master key requirement**: `J_PyDB.setMasterKey(...)` must be called *before* instantiating `J_PyDB`. If not, the constructor will raise `J_PyDBError`.
-- **Encryption**: Uses `cryptography.fernet`. The passphrase is hashed with SHA-256 and then URL-safe base64 encoded to 32 bytes for Fernet. Keep your passphrase safe — losing it means encrypted data is unrecoverable.
+- **Master key requirement**: `setMasterKey(...)` is optional. You only need to call it if you want to use encryption (`encrypt=True` / `decrypt=True`). If you attempt encryption without a master key, an exception will be raised.
+- **Hashing vs encryption**: Hashing (PBKDF2) is non-reversible — use it for password verification, not for data you need back. Encryption (Fernet) is reversible but requires safe storage of the passphrase.
+- **Hash format**: The stored hash string is structured:  
+
+~~~
+HASH$pbkdf2_sha256$<iterations>$<salt_b64>$<hash_b64>
+~~~
+
+Do **not** attempt to decrypt hashed values; use `verify_value`.
+- **Backward compatibility**: Encrypted values stored with older versions (raw Fernet tokens starting `gAAAA`) are still supported.
 - **Text vs binary detection**: `export_table` attempts a UTF-8 decode for files; if decoding fails, the binary is returned as raw bytes.
-- **Atomicity**: File writes use plain open/write — this library is minimal and not intended for heavy concurrent DB workloads. It does use an `RLock` internally to reduce races, but it's not a replacement for a real DB for concurrent heavy writes.
+- **Atomicity**: File writes use plain open/write — this library is minimal and not intended for heavy concurrent DB workloads. It uses an `RLock` internally but it's not a replacement for a real DB under heavy concurrent writes.
 - **Filenames**: Values are stored as `leaf.txt`. Binary files preserve the original filename (no `.txt` appended).
-- **Transactions**: are lightweight — they stage operations and apply them on `commit`. They don't provide rollback of already-applied OS-level filesystem changes (use with care).
+- **Transactions**: are lightweight — they stage operations and apply them on `commit`. They don't provide rollback of already-applied OS-level filesystem changes.
 
 ---
 
-## Security tips
-- Use a strong passphrase with `setMasterKey`.
-- Ensure file permissions on the `base_path` are restricted (e.g., `chmod 700` on UNIX).
-- Remember: anyone with the master passphrase (or access to the key material) can decrypt all encrypted entries.
+## Security tips 🔒
+- Use a strong passphrase with `setMasterKey` if you use encryption.
+- For hashed values, use a high iteration count (default 100,000). Increase via `J_PyDB.set_default_hash_iterations(...)` as hardware improves.
+- Keep the `base_path` file permissions restricted (e.g., `chmod 700` on UNIX).
+- Never store the passphrase in source control.
+- Remember: hashed values are non-reversible; encrypted values are only as safe as your passphrase.
 
 ---
 
 ## Example full script
-~~~python
+~~~
 # minimal_example.py
 from J_PyDB import J_PyDB, J_PyDBError
 
+# optional; only required if you plan to use encrypt/decrypt
 J_PyDB.setMasterKey("please-use-a-strong-passphrase")
-db = J_PyDB(base_path="my_db_folder")
 
+db = J_PyDB(base_path="my_db_folder")
 db.create_db("App")
 db.create_table("App", "Users")
 
-# create user with encrypted password
-db.write_value("App", "Users", "john_doe", value="s3cret", encrypt=True)
+# encrypted password (reversible)
+db.write_value("App", "Users", "john_secret", value="s3cret", encrypt=True)
+print("Decrypted:", db.read_value("App", "Users", "john_secret", decrypt=True))
 
-# read it back
-pwd = db.read_value("App", "Users", "john_doe", decrypt=True)
-print("Decrypted password:", pwd)
+# hashed password (non-reversible)
+db.write_value("App", "Users", "john_pw", value="s3cret", hash=True)
+print("Verify:", db.verify_value("App", "Users", "john_pw", "s3cret"))
 ~~~
 
 ---
 
 ## Contributing
-Pull requests welcome! Keep changes small & well documented. If you want to add stronger transaction semantics, locks or file-atomic writes, open an issue and let's chat.
+Pull requests welcome! Keep changes small & well documented. If you want to add stronger transaction semantics, file-atomic writes, alternative hashing algorithms (bcrypt/scrypt/argon2), or metadata-sidecars (`value.meta.json`) next to value files, open an issue and let's chat — happy to collab. 🎉
 
 ---
 
